@@ -19,7 +19,6 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 
 import { useClientSettings, useUpdateClientSettings } from "../../hooks/useSettings";
 import {
-  deriveLogicalProjectKeyFromSettings,
   deriveProjectGroupingOverrideKey,
   selectProjectGroupingSettings,
   type ProjectGroupingMode,
@@ -28,11 +27,12 @@ import { useComposerDraftStore } from "../../composerDraftStore";
 import { releaseProjectDraftUploads } from "../../lib/composerDraftUploads";
 import { readLocalApi } from "../../localApi";
 import {
+  buildPhysicalToLogicalProjectKeyMap,
   type SidebarProjectGroupMember,
   type SidebarProjectSnapshot,
 } from "../../sidebarProjectGrouping";
 import { useEnvironments, usePrimaryEnvironmentId } from "../../state/environments";
-import { useThreadShells } from "../../state/entities";
+import { useProjects, useThreadShells } from "../../state/entities";
 import { projectEnvironment } from "../../state/projects";
 import { ProjectFavicon } from "../ProjectFavicon";
 import { Alert, AlertDescription } from "../ui/alert";
@@ -61,12 +61,69 @@ const ProjectIconPickerDialog = lazy(() =>
   })),
 );
 
-const GROUPING_LABELS: Record<ProjectGroupingMode | "inherit", string> = {
+type CheckoutGrouping = ProjectGroupingMode | "inherit";
+
+const GROUPING_LABELS: Record<CheckoutGrouping, string> = {
   inherit: "Use global default",
   repository: "Group by repository",
   repository_path: "Group by repository path",
   separate: "Keep separate",
 };
+
+function isCheckoutGrouping(value: string | null): value is CheckoutGrouping {
+  return value !== null && Object.hasOwn(GROUPING_LABELS, value);
+}
+
+/** Device-local grouping for one checkout. Settings follow the checkout into its new group. */
+function CheckoutGroupingSelect({ member }: { member: SidebarProjectGroupMember }) {
+  const navigate = useNavigate({ from: "/settings" });
+  const projects = useProjects();
+  const settings = useClientSettings(selectProjectGroupingSettings);
+  const updateClientSettings = useUpdateClientSettings();
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const overrideKey = deriveProjectGroupingOverrideKey(member);
+  const choice = settings.sidebarProjectGroupingOverrides[overrideKey] ?? "inherit";
+
+  const changeGrouping = (value: string | null) => {
+    if (!isCheckoutGrouping(value) || value === choice) return;
+    const overrides = { ...settings.sidebarProjectGroupingOverrides };
+    if (value === "inherit") delete overrides[overrideKey];
+    else overrides[overrideKey] = value;
+    void updateClientSettings({ sidebarProjectGroupingOverrides: overrides });
+    // Resolve the key like the sidebar does, so a sibling's repository identity still counts.
+    const project =
+      buildPhysicalToLogicalProjectKeyMap({
+        projects,
+        settings: { ...settings, sidebarProjectGroupingOverrides: overrides },
+        primaryEnvironmentId,
+      }).get(member.physicalProjectKey) ?? member.physicalProjectKey;
+    void navigate({
+      to: "/settings/projects",
+      search: (previous) => ({ ...previous, project }),
+      replace: true,
+      resetScroll: false,
+    });
+  };
+
+  return (
+    <Select value={choice} onValueChange={changeGrouping}>
+      <SelectTrigger
+        size="sm"
+        className="w-52"
+        aria-label={`Grouping for checkout ${member.workspaceRoot} on ${member.environmentLabel ?? "environment"}`}
+      >
+        <SelectValue>{GROUPING_LABELS[choice]}</SelectValue>
+      </SelectTrigger>
+      <SelectPopup align="end" alignItemWithTrigger={false}>
+        {Object.entries(GROUPING_LABELS).map(([value, label]) => (
+          <SelectItem key={value} value={value}>
+            {label}
+          </SelectItem>
+        ))}
+      </SelectPopup>
+    </Select>
+  );
+}
 
 function memberKey(member: { environmentId: string; id: string }): string {
   return `${member.environmentId}:${member.id}`;
@@ -183,8 +240,6 @@ function ProjectDetail({
   hasOtherMembers: boolean;
 }) {
   const navigate = useNavigate({ from: "/settings" });
-  const groupingSettings = useClientSettings(selectProjectGroupingSettings);
-  const updateClientSettings = useUpdateClientSettings();
   const primaryEnvironmentId = usePrimaryEnvironmentId();
   const { environments } = useEnvironments();
   const environmentById = useMemo(
@@ -446,62 +501,7 @@ function ProjectDetail({
           description={member.workspaceRoot}
           control={
             <div className="flex flex-wrap items-center gap-2">
-              <Select
-                value={
-                  groupingSettings.sidebarProjectGroupingOverrides[
-                    deriveProjectGroupingOverrideKey(member)
-                  ] ?? "inherit"
-                }
-                onValueChange={(value) => {
-                  if (
-                    value !== "inherit" &&
-                    value !== "repository" &&
-                    value !== "repository_path" &&
-                    value !== "separate"
-                  )
-                    return;
-                  const overrides = { ...groupingSettings.sidebarProjectGroupingOverrides };
-                  const key = deriveProjectGroupingOverrideKey(member);
-                  if (value === "inherit") delete overrides[key];
-                  else overrides[key] = value;
-                  void updateClientSettings({ sidebarProjectGroupingOverrides: overrides });
-                  void navigate({
-                    to: "/settings/projects",
-                    search: (previous) => ({
-                      ...previous,
-                      project: deriveLogicalProjectKeyFromSettings(member, {
-                        ...groupingSettings,
-                        sidebarProjectGroupingOverrides: overrides,
-                      }),
-                    }),
-                    replace: true,
-                    resetScroll: false,
-                  });
-                }}
-              >
-                <SelectTrigger
-                  size="sm"
-                  className="w-52"
-                  aria-label={`Grouping for checkout ${member.workspaceRoot} on ${member.environmentLabel ?? "environment"}`}
-                >
-                  <SelectValue>
-                    {
-                      GROUPING_LABELS[
-                        groupingSettings.sidebarProjectGroupingOverrides[
-                          deriveProjectGroupingOverrideKey(member)
-                        ] ?? "inherit"
-                      ]
-                    }
-                  </SelectValue>
-                </SelectTrigger>
-                <SelectPopup align="end" alignItemWithTrigger={false}>
-                  {Object.entries(GROUPING_LABELS).map(([value, label]) => (
-                    <SelectItem key={value} value={value}>
-                      {label}
-                    </SelectItem>
-                  ))}
-                </SelectPopup>
-              </Select>
+              <CheckoutGroupingSelect member={member} />
               <Button
                 size="sm"
                 variant="outline"
